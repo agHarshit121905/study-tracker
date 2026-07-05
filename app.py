@@ -9,6 +9,7 @@ this month -- prioritising weak and stale topics and flagging syllabus gaps.
 """
 
 import json
+import os
 from datetime import date
 
 import streamlit as st
@@ -16,6 +17,31 @@ import streamlit as st
 import engine
 
 st.set_page_config(page_title="Interview Prep Tracker", page_icon="📚", layout="wide")
+
+
+def _load_secrets_into_env():
+    """Copy Streamlit secrets into env so engine.py (which reads os.environ)
+    can find Turso / Gemini credentials when deployed. No-op if unset."""
+    for k in ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN",
+              "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        try:
+            if k in st.secrets and not os.environ.get(k):
+                os.environ[k] = str(st.secrets[k])
+        except Exception:
+            pass
+
+
+_load_secrets_into_env()
+
+
+@st.cache_resource
+def _bootstrap():
+    """Create the table / run migration once per app instance."""
+    engine.init_db()
+    return True
+
+
+_bootstrap()
 
 syllabus = engine.load_syllabus()
 
@@ -43,6 +69,11 @@ with st.sidebar:
     st.metric("Entries logged", len(log))
 
     st.divider()
+    storage = ("☁️ Turso — persists across redeploys"
+               if os.environ.get("TURSO_DATABASE_URL")
+               and os.environ.get("TURSO_AUTH_TOKEN")
+               else "💾 Local file (data/study.db)")
+    st.caption(f"Storage: {storage}")
     st.caption("Backup / restore your log")
     st.download_button(
         "⬇️ Download log.json",
@@ -106,13 +137,23 @@ with tab_log:
     if log:
         st.divider()
         st.subheader("Recent entries")
-        recent = sorted(log, key=lambda e: e["date"], reverse=True)[:8]
+        recent = sorted(log, key=lambda e: (e["date"], e.get("id", 0)),
+                        reverse=True)[:8]
         for e in recent:
             badge = engine.CONFIDENCE_LABELS[e["confidence"]]
-            line = f"**{e['date']}** — {e['subject']} → {e['subtopic']}  ·  _{badge}_"
-            if e.get("notes"):
-                line += f"  \n  📝 {e['notes']}"
-            st.markdown(line)
+            col_txt, col_btn = st.columns([12, 1])
+            with col_txt:
+                line = (f"**{e['date']}** — {e['subject']} → {e['subtopic']}"
+                        f"  ·  _{badge}_")
+                if e.get("notes"):
+                    line += f"  \n  📝 {e['notes']}"
+                st.markdown(line)
+            with col_btn:
+                if e.get("id") is not None and st.button(
+                        "🗑️", key=f"del_{e['id']}", help="Delete this entry"):
+                    engine.delete_entry(e["id"])
+                    refresh_log()
+                    st.rerun()
 
 
 # --------------------------------------------------------------------------- #
