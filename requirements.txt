@@ -1,0 +1,3 @@
+streamlit>=1.30
+# Optional -- only needed for the "Write it up with AI" toggle:
+google-genai>=0.3
