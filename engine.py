@@ -15,13 +15,16 @@ tracked as gaps so they can be scheduled as new learning.
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
 
 DATA_DIR = Path(__file__).parent / "data"
 SYLLABUS_PATH = DATA_DIR / "syllabus.json"
-LOG_PATH = DATA_DIR / "log.json"
+LOG_PATH = DATA_DIR / "log.json"          # legacy; auto-migrated into the DB
+DB_PATH = DATA_DIR / "study.db"           # local SQLite store
 
 # Confidence (1-5) -> ideal number of days before a topic should be revised.
 # Weak topics come back fast; strong topics can wait longer.
@@ -35,41 +38,187 @@ CONFIDENCE_LABELS = {
     5: "Confident",
 }
 
+# Built-in fallback used if data/syllabus.json is missing (e.g. the folder
+# didn't get committed to the repo). Kept in sync with data/syllabus.json.
+DEFAULT_SYLLABUS = {
+    "DSA": [
+        "Arrays & Two Pointers", "Strings", "Linked Lists", "Stacks & Queues",
+        "Hashing / Hash Maps", "Recursion & Backtracking", "Trees & BSTs",
+        "Heaps / Priority Queues", "Graphs (BFS/DFS)", "Shortest Paths",
+        "Dynamic Programming", "Greedy Algorithms", "Sorting & Searching",
+        "Sliding Window", "Bit Manipulation",
+    ],
+    "Operating Systems": [
+        "Processes & Threads", "CPU Scheduling",
+        "Synchronization (Locks/Semaphores)", "Deadlocks", "Memory Management",
+        "Paging & Virtual Memory", "File Systems", "IPC",
+    ],
+    "DBMS": [
+        "ER Model & Schema Design", "Normalization", "SQL Queries & Joins",
+        "Transactions & ACID", "Concurrency Control", "Indexing",
+        "Query Optimization", "NoSQL Basics",
+    ],
+    "Computer Networks": [
+        "OSI & TCP/IP Models", "TCP vs UDP", "HTTP / HTTPS", "DNS",
+        "IP Addressing & Subnetting", "Routing", "NAT & Firewalls",
+        "Application Layer Protocols",
+    ],
+    "OOP": [
+        "Encapsulation", "Inheritance", "Polymorphism", "Abstraction",
+        "SOLID Principles", "Common Design Patterns",
+        "Composition vs Inheritance",
+    ],
+    "System Design": [
+        "Scalability Basics", "Load Balancing", "Caching",
+        "Database Sharding & Replication", "CAP Theorem", "Message Queues",
+        "Microservices vs Monolith", "Rate Limiting",
+    ],
+    "CS Fundamentals": [
+        "Time & Space Complexity", "Number Systems",
+        "Computer Architecture Basics", "Compilers vs Interpreters",
+    ],
+}
+
 
 # --------------------------------------------------------------------------- #
 # Persistence
 # --------------------------------------------------------------------------- #
 def load_syllabus() -> dict[str, list[str]]:
-    with open(SYLLABUS_PATH) as f:
-        return json.load(f)
+    """Load the syllabus from data/syllabus.json, or fall back to the built-in
+    DEFAULT_SYLLABUS if that file is missing or unreadable. This keeps the app
+    running even when the data/ folder didn't get committed to the repo."""
+    try:
+        with open(SYLLABUS_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return DEFAULT_SYLLABUS
+
+
+# --------------------------------------------------------------------------- #
+# Study log: SQLite backend (local file OR hosted Turso/libSQL)
+# --------------------------------------------------------------------------- #
+# Local runs use a plain SQLite file (data/study.db) via the stdlib sqlite3
+# module -- no extra dependency, and it persists on your machine.
+#
+# On an ephemeral host like Streamlit Community Cloud a local file is wiped on
+# every redeploy, so for a *persistent deployment* set TURSO_DATABASE_URL and
+# TURSO_AUTH_TOKEN (free hosted SQLite). The exact same SQL runs against both.
+
+def _use_turso() -> bool:
+    return bool(os.environ.get("TURSO_DATABASE_URL")
+                and os.environ.get("TURSO_AUTH_TOKEN"))
+
+
+def _connect():
+    """Open a connection to Turso if credentials are set, else local SQLite."""
+    if _use_turso():
+        import libsql  # pip install libsql  (only needed for hosted mode)
+        return libsql.connect(
+            database=os.environ["TURSO_DATABASE_URL"],
+            auth_token=os.environ["TURSO_AUTH_TOKEN"],
+        )
+    DATA_DIR.mkdir(exist_ok=True)
+    return sqlite3.connect(DB_PATH)
+
+
+def _close(conn) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+_COLUMNS = "id, date, subject, subtopic, confidence, notes"
+_INSERT = ("INSERT INTO entries (date, subject, subtopic, confidence, notes) "
+           "VALUES (?, ?, ?, ?, ?)")
+
+
+def init_db() -> None:
+    """Create the table if needed and migrate a legacy data/log.json once."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS entries ("
+            "id INTEGER PRIMARY KEY, "
+            "date TEXT NOT NULL, "
+            "subject TEXT NOT NULL, "
+            "subtopic TEXT NOT NULL, "
+            "confidence INTEGER NOT NULL, "
+            "notes TEXT DEFAULT '')"
+        )
+        conn.commit()
+        count = conn.execute("SELECT COUNT(*) FROM entries").fetchall()[0][0]
+        if count == 0 and LOG_PATH.exists():
+            try:
+                with open(LOG_PATH) as f:
+                    legacy = json.load(f)
+            except Exception:
+                legacy = []
+            for e in legacy:
+                conn.execute(_INSERT, (
+                    e.get("date"), e.get("subject"), e.get("subtopic"),
+                    int(e.get("confidence", 3)), (e.get("notes") or "").strip(),
+                ))
+            conn.commit()
+    finally:
+        _close(conn)
+
+
+def _row_to_dict(r) -> dict:
+    return {"id": r[0], "date": r[1], "subject": r[2], "subtopic": r[3],
+            "confidence": r[4], "notes": r[5] or ""}
 
 
 def load_log() -> list[dict]:
-    if not LOG_PATH.exists():
-        return []
-    with open(LOG_PATH) as f:
-        return json.load(f)
-
-
-def save_log(entries: list[dict]) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(LOG_PATH, "w") as f:
-        json.dump(entries, f, indent=2)
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"SELECT {_COLUMNS} FROM entries ORDER BY date ASC, id ASC"
+        ).fetchall()
+    finally:
+        _close(conn)
+    return [_row_to_dict(r) for r in rows]
 
 
 def add_entry(subject: str, subtopic: str, confidence: int,
               notes: str = "", when: date | None = None) -> list[dict]:
-    """Append a study entry and persist. Returns the updated log."""
-    entries = load_log()
-    entries.append({
-        "date": (when or date.today()).isoformat(),
-        "subject": subject,
-        "subtopic": subtopic,
-        "confidence": int(confidence),
-        "notes": (notes or "").strip(),
-    })
-    save_log(entries)
-    return entries
+    """Insert one study entry. Returns the updated log."""
+    conn = _connect()
+    try:
+        conn.execute(_INSERT, (
+            (when or date.today()).isoformat(), subject, subtopic,
+            int(confidence), (notes or "").strip(),
+        ))
+        conn.commit()
+    finally:
+        _close(conn)
+    return load_log()
+
+
+def delete_entry(entry_id: int) -> list[dict]:
+    """Remove a single entry by id. Returns the updated log."""
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+        conn.commit()
+    finally:
+        _close(conn)
+    return load_log()
+
+
+def save_log(entries: list[dict]) -> None:
+    """Replace the whole log (used by the sidebar restore-from-JSON button)."""
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM entries")
+        for e in entries:
+            conn.execute(_INSERT, (
+                e.get("date"), e.get("subject"), e.get("subtopic"),
+                int(e.get("confidence", 3)), (e.get("notes") or "").strip(),
+            ))
+        conn.commit()
+    finally:
+        _close(conn)
 
 
 # --------------------------------------------------------------------------- #
@@ -264,8 +413,6 @@ def narrative_plan(daily, weekly, monthly, api_key=None):
     Returns None if no key or the SDK isn't installed, so the app can fall back
     to the rule-based view. Set GEMINI_API_KEY (or GOOGLE_API_KEY) to enable.
     """
-    import os
-
     key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         return None
